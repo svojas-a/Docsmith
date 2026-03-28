@@ -1,41 +1,5 @@
-package main
-
-import (
-	"fmt"
-	"os"
-	"strings"
-
-	"docksmith/parser"
-)
-
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: docksmith <command>")
-		return
-	}
-
-	command := os.Args[1]
-
-	switch command {
-
-	case "build":
-		handleBuild()
-
-	case "run":
-		fmt.Println("Run not implemented")
-
-	case "images":
-		fmt.Println("Images not implemented")
-
-	case "rmi":
-		fmt.Println("RMI not implemented")
-
-	default:
-		fmt.Println("Unknown command")
-	}
-}
-
 func handleBuild() {
+
 	args := os.Args
 
 	// Default tag
@@ -62,4 +26,24 @@ func handleBuild() {
 	for i, inst := range instructions {
 		fmt.Printf("%d. %s %s\n", i+1, inst.Type, strings.Join(inst.Args, " "))
 	}
+
+	// ----------------------------
+	// Create Tar (Layer)
+	// ----------------------------
+	err = storage.CreateTar(".", "layer.tar")
+	if err != nil {
+		fmt.Println("Tar error:", err)
+		return
+	}
+
+	// ----------------------------
+	// Save Layer (Content Addressing)
+	// ----------------------------
+	layerHash, err := storage.SaveLayer("layer.tar")
+	if err != nil {
+		fmt.Println("Save layer error:", err)
+		return
+	}
+
+	fmt.Println("Layer hash:", layerHash)
 }
