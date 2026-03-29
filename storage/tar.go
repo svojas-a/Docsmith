@@ -9,7 +9,6 @@ import (
 )
 
 func CreateTar(sourceDir string, tarPath string) error {
-
 	tarFile, err := os.Create(tarPath)
 	if err != nil {
 		return err
@@ -20,35 +19,27 @@ func CreateTar(sourceDir string, tarPath string) error {
 	defer tarWriter.Close()
 
 	return filepath.Walk(sourceDir, func(file string, info os.FileInfo, err error) error {
-
 		if err != nil {
 			return err
 		}
-
-		// ❌ Skip directories
 		if info.IsDir() {
 			return nil
 		}
-
-		// ❌ Skip unwanted files
 		if strings.Contains(file, ".git") || strings.Contains(file, "layer.tar") || strings.Contains(file, ".DS_Store") {
 			return nil
 		}
 
-		// Open file
 		f, err := os.Open(file)
 		if err != nil {
 			return err
 		}
 
-		// Create header
 		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			f.Close()
 			return err
 		}
 
-		// Relative path
 		relPath, err := filepath.Rel(sourceDir, file)
 		if err != nil {
 			f.Close()
@@ -56,68 +47,89 @@ func CreateTar(sourceDir string, tarPath string) error {
 		}
 		header.Name = relPath
 
-		// Write header
 		if err := tarWriter.WriteHeader(header); err != nil {
 			f.Close()
 			return err
 		}
 
-		// Write content
 		_, err = io.Copy(tarWriter, f)
-
-		// CLOSE FILE HERE ✅
 		f.Close()
-
 		return err
 	})
 }
 
-
-// ExtractTar extracts a tar archive into a directory
+// ExtractTar extracts a tar archive into a directory, handling symlinks and special files
 func ExtractTar(tarPath string, destDir string) error {
-
-	// Step 1: Open tar file
 	file, err := os.Open(tarPath)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Step 2: Create tar reader
 	tarReader := tar.NewReader(file)
 
 	for {
-		// Step 3: Read next file
 		header, err := tarReader.Next()
-
 		if err == io.EOF {
-			break // End of tar
+			break
 		}
 		if err != nil {
 			return err
 		}
 
-		// Step 4: Create full path
-		targetPath := filepath.Join(destDir, header.Name)
-
-		// Step 5: Create directories if needed
-		err = os.MkdirAll(filepath.Dir(targetPath), 0755)
-		if err != nil {
-			return err
+		// Clean the path and skip anything trying to escape destDir
+		cleanName := filepath.Clean(header.Name)
+		if strings.HasPrefix(cleanName, "..") {
+			continue
 		}
 
-		// Step 6: Create file
-		outFile, err := os.Create(targetPath)
-		if err != nil {
-			return err
-		}
+		targetPath := filepath.Join(destDir, cleanName)
 
-		// Step 7: Copy content
-		_, err = io.Copy(outFile, tarReader)
-		outFile.Close()
+		switch header.Typeflag {
 
-		if err != nil {
-			return err
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)|0755); err != nil {
+				return err
+			}
+
+		case tar.TypeReg, tar.TypeRegA:
+			// Ensure parent dir exists
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return err
+			}
+			// Remove existing file/symlink at this path before writing
+			os.Remove(targetPath)
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(outFile, tarReader)
+			outFile.Close()
+			if err != nil {
+				return err
+			}
+
+		case tar.TypeSymlink:
+			// Remove existing entry before creating symlink
+			os.Remove(targetPath)
+			os.MkdirAll(filepath.Dir(targetPath), 0755)
+			if err := os.Symlink(header.Linkname, targetPath); err != nil {
+				// Ignore symlink errors (e.g. already exists)
+				continue
+			}
+
+		case tar.TypeLink:
+			// Hard link
+			linkTarget := filepath.Join(destDir, filepath.Clean(header.Linkname))
+			os.Remove(targetPath)
+			os.MkdirAll(filepath.Dir(targetPath), 0755)
+			if err := os.Link(linkTarget, targetPath); err != nil {
+				continue
+			}
+
+		default:
+			// Skip special files (dev/console, sockets, etc.) - safe to ignore
+			continue
 		}
 	}
 

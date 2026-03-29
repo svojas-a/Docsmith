@@ -1,49 +1,61 @@
-func handleBuild() {
+package main
 
+import (
+	"fmt"
+	"os"
+
+	"docksmith/build"
+	"docksmith/parser"
+)
+
+func main() {
 	args := os.Args
+	if len(args) < 2 {
+		fmt.Println("Usage: docksmith build -t <tag> <context>")
+		return
+	}
 
-	// Default tag
+	switch args[1] {
+	case "build":
+		handleBuild()
+	default:
+		fmt.Println("Unknown command:", args[1])
+	}
+}
+
+func handleBuild() {
+	args := os.Args
 	tag := "latest"
+	contextDir := "."
+	noCache := false
 
-	// Parse -t flag
-	for i := 0; i < len(args); i++ {
-		if args[i] == "-t" && i+1 < len(args) {
-			tag = args[i+1]
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "-t":
+			if i+1 < len(args) {
+				tag = args[i+1]
+				i++
+			}
+		case "--no-cache":
+			noCache = true
+		default:
+			contextDir = args[i]
 		}
 	}
 
-	fmt.Println("Building image with tag:", tag)
-
-	// Parse Docksmithfile
-	instructions, err := parser.ParseDocksmithfile("Docksmithfile")
+	instructions, err := parser.ParseDocksmithfile(contextDir + "/Docksmithfile")
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		fmt.Println("Error parsing Docksmithfile:", err)
+		os.Exit(1)
 	}
 
-	fmt.Println("Parsed Instructions:")
-
-	for i, inst := range instructions {
-		fmt.Printf("%d. %s %s\n", i+1, inst.Type, strings.Join(inst.Args, " "))
-	}
-
-	// ----------------------------
-	// Create Tar (Layer)
-	// ----------------------------
-	err = storage.CreateTar(".", "layer.tar")
+	err = build.Run(instructions, build.BuildOptions{
+		Tag:     tag,
+		Context: contextDir,
+		NoCache: noCache,
+	})
 	if err != nil {
-		fmt.Println("Tar error:", err)
-		return
+		fmt.Println("Build failed:", err)
+		os.Exit(1)
 	}
-
-	// ----------------------------
-	// Save Layer (Content Addressing)
-	// ----------------------------
-	layerHash, err := storage.SaveLayer("layer.tar")
-	if err != nil {
-		fmt.Println("Save layer error:", err)
-		return
-	}
-
-	fmt.Println("Layer hash:", layerHash)
 }
