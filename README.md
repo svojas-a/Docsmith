@@ -129,3 +129,76 @@ tempDir := "/tmp/build"
 
 storage.CreateTar(tempDir, "layer.tar")
 hash, _ := storage.SaveLayer("layer.tar")
+
+## 🚧 Build Engine (Swathi Kumar)
+
+### ✅ Completed Work
+
+- Implemented execution for core instructions:
+  - `FROM`
+  - `WORKDIR`
+  - `COPY`
+  - `RUN`
+  - `CMD`
+- Built a **layered filesystem** using storage APIs
+- Implemented **caching mechanism** using SHA256 keys
+- Generated **image manifest** (config + layers)
+- Used `/tmp` as the build directory
+- Adapted `RUN` instruction for WSL (no `chroot` support)
+
+---
+
+### ⚙️ Build Flow
+Parse → Execute → Modify Filesystem → Create Layer → Save → Cache → Generate Manifest
+
+---
+
+### 🚀 Key Features
+
+- Layer-based image building system
+- Efficient caching for faster rebuilds
+- Support for:
+  - `WORKDIR`
+  - `ENV`
+- Build context support (`COPY . .`)
+- Deterministic builds using hashing
+
+---
+
+## 🧪 Container Runtime (Person 4)
+
+### 🎯 Responsibilities
+
+- Implement `docksmith run <image>`
+- Load and interpret image manifest
+- Reconstruct filesystem from stored layers
+- Execute container using:
+  - `CMD`
+  - `ENV`
+  - `WORKDIR`
+
+---
+
+### ⚙️ Runtime Flow
+Load Manifest → Extract Layers → Setup Environment → Execute CMD
+
+---
+
+### 🚀 Expected Features
+
+- Run built images as containers
+- Basic isolation using:
+  - `chroot`
+  - `unshare` (if supported)
+- Environment variable support
+- Working directory handling
+
+---
+
+## 📦 Usage
+
+### Build an Image
+
+```bash
+./docksmith build -t myimage:latest
+
