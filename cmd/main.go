@@ -6,18 +6,38 @@ import (
 
 	"docksmith/build"
 	"docksmith/parser"
+	"docksmith/runtime"
 )
 
 func main() {
 	args := os.Args
+
 	if len(args) < 2 {
-		fmt.Println("Usage: docksmith build -t <tag> <context>")
+		fmt.Println("Usage:")
+		fmt.Println("  docksmith build -t <tag> <context>")
+		fmt.Println("  docksmith run <image>")
 		return
 	}
 
 	switch args[1] {
+
 	case "build":
 		handleBuild()
+
+	case "run":
+		if len(args) < 3 {
+			fmt.Println("Usage: docksmith run <image>")
+			return
+		}
+
+		image := args[2]
+
+		err := runtime.RunContainer(image)
+		if err != nil {
+			fmt.Println("Run failed:", err)
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Println("Unknown command:", args[1])
 	}
@@ -25,6 +45,7 @@ func main() {
 
 func handleBuild() {
 	args := os.Args
+
 	tag := "latest"
 	contextDir := "."
 	noCache := false

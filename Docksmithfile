@@ -1,5 +1,5 @@
-FROM ubuntu
+FROM scratch
 WORKDIR /app
 COPY . .
-RUN go build -o app
-CMD ["./app"]
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o app ./cmd
+CMD ["app"]

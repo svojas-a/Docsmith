@@ -22,38 +22,47 @@ func CreateTar(sourceDir string, tarPath string) error {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			return nil
-		}
+
+		// Skip unwanted files
 		if strings.Contains(file, ".git") || strings.Contains(file, "layer.tar") || strings.Contains(file, ".DS_Store") {
 			return nil
 		}
 
-		f, err := os.Open(file)
-		if err != nil {
-			return err
-		}
-
+		// Create tar header
 		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
-			f.Close()
 			return err
 		}
 
+		// 🔥 Preserve permissions (VERY IMPORTANT)
+		header.Mode = int64(info.Mode())
+
+		// Get relative path
 		relPath, err := filepath.Rel(sourceDir, file)
 		if err != nil {
-			f.Close()
 			return err
 		}
 		header.Name = relPath
 
+		// Write header (for BOTH file + directory)
 		if err := tarWriter.WriteHeader(header); err != nil {
-			f.Close()
 			return err
 		}
 
+		// If directory → no content to write
+		if info.IsDir() {
+			return nil
+		}
+
+		// Open file
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		// Copy file content into tar
 		_, err = io.Copy(tarWriter, f)
-		f.Close()
 		return err
 	})
 }
