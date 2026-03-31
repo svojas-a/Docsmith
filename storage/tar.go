@@ -49,10 +49,28 @@ func CreateTar(sourceDir string, tarPath string) error {
 			return err
 		}
 
-		// If directory → no content to write
-		if info.IsDir() {
-			return nil
-		}
+		// Create header for both files AND directories
+header, err = tar.FileInfoHeader(info, "")
+if err != nil {
+	return err
+}
+
+relPath, err = filepath.Rel(sourceDir, file)
+if err != nil {
+	return err
+}
+
+header.Name = relPath
+
+// Write header
+if err := tarWriter.WriteHeader(header); err != nil {
+    return err
+}
+
+// If directory → stop here
+if info.IsDir() {
+    return nil
+}
 
 		// Open file
 		f, err := os.Open(file)
