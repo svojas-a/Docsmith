@@ -73,7 +73,6 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			baseImage := instr.Args[0]
 			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, baseImage)
 
-			// ✅ HANDLE SCRATCH (EMPTY BASE)
 			if baseImage == "scratch" {
 				fmt.Println("Using empty base image (scratch)")
 				workDir = ""
@@ -121,20 +120,17 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, kv)
 
 		case "CMD":
-
-	        // FIX: unwrap JSON string if needed
-	        if len(instr.Args) == 1 && strings.HasPrefix(instr.Args[0], "[") {
-		        var parsed []string
-		        if err := json.Unmarshal([]byte(instr.Args[0]), &parsed); err == nil {
-			        cmdDefault = parsed
-		        } else {
-			        cmdDefault = instr.Args
-		        }
-	        } else {
-		        cmdDefault = instr.Args
-	        }
-
-	fmt.Printf("Step %d/%d : CMD %v\n", stepNum, total, cmdDefault)
+			if len(instr.Args) == 1 && strings.HasPrefix(instr.Args[0], "[") {
+				var parsed []string
+				if err := json.Unmarshal([]byte(instr.Args[0]), &parsed); err == nil {
+					cmdDefault = parsed
+				} else {
+					cmdDefault = instr.Args
+				}
+			} else {
+				cmdDefault = instr.Args
+			}
+			fmt.Printf("Step %d/%d : CMD %v\n", stepNum, total, cmdDefault)
 
 		case "COPY":
 			src := instr.Args[0]
@@ -163,8 +159,16 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			cacheMissed = true
 			start := time.Now()
 			os.MkdirAll(filepath.Join(buildRoot, workDir), 0755)
-			performCopy(opts.Context, src, buildRoot, dest, workDir)
-			hash, _ := saveLayer(buildRoot)
+			if err := performCopy(opts.Context, src, buildRoot, dest, workDir); err != nil {
+				return fmt.Errorf("COPY failed: %w", err)
+			}
+			// FIX: propagate saveLayer error — previously `hash, _ :=` silently
+			// swallowed errors (e.g. cross-fs Rename failure in WSL), causing
+			// empty "sha256:" digests in the manifest and broken layer extraction.
+			hash, err := saveLayer(buildRoot)
+			if err != nil {
+				return fmt.Errorf("COPY saveLayer failed: %w", err)
+			}
 			if !opts.NoCache {
 				cacheIndex[cacheKey] = hash
 				saveCacheIndex(cacheIndex)
@@ -205,23 +209,31 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			if err := executeRun(buildRoot, workDir, command, envMap); err != nil {
 				return fmt.Errorf("RUN failed: %w", err)
 			}
-			fmt.Println("DEBUG: listing files after RUN")
-			exec.Command("ls", "-R", filepath.Join(buildRoot, workDir)).Run()
 
-			// ✅ After successful build → set executable permission
-			// Make all binaries executable after RUN
+			// Make all extension-less files in workdir executable (likely binaries)
 			filepath.Walk(filepath.Join(buildRoot, workDir), func(path string, info os.FileInfo, err error) error {
 				if err != nil || info.IsDir() {
 					return nil
 				}
-
-				// If no extension → likely binary
 				if filepath.Ext(path) == "" {
 					os.Chmod(path, 0755)
 				}
 				return nil
 			})
-			hash, _ := saveLayer(buildRoot)
+
+			// Debug: show what landed in the workdir after RUN
+			fmt.Printf("DEBUG: files in %s after RUN:\n", filepath.Join(buildRoot, workDir))
+			entries, _ := os.ReadDir(filepath.Join(buildRoot, workDir))
+			for _, e := range entries {
+				info, _ := e.Info()
+				fmt.Printf("  %s (mode=%s, size=%d)\n", e.Name(), info.Mode(), info.Size())
+			}
+
+			// FIX: propagate saveLayer error — same as COPY case above
+			hash, err := saveLayer(buildRoot)
+			if err != nil {
+				return fmt.Errorf("RUN saveLayer failed: %w", err)
+			}
 			if !opts.NoCache {
 				cacheIndex[cacheKey] = hash
 				saveCacheIndex(cacheIndex)
@@ -238,7 +250,6 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			return fmt.Errorf("unknown instruction %q", instr.Type)
 		}
 	}
-	
 
 	manifest := Manifest{
 		Name:    name,
@@ -324,24 +335,31 @@ func computeCopyKey(prev, instr, wd string, env map[string]string, contextDir, s
 func executeRun(buildRoot, workDir, command string, envMap map[string]string) error {
 	cmd := exec.Command("sh", "-c", command)
 
-	// Set working directory inside buildRoot
 	if workDir != "" {
 		cmd.Dir = filepath.Join(buildRoot, workDir)
 	} else {
 		cmd.Dir = buildRoot
 	}
 
-	// Base environment
-	cmd.Env = os.Environ()
+	// FIX: Keep GOPATH and GOCACHE outside buildRoot so that:
+	//   1. Module downloads work (persistent cache across builds)
+	//   2. These dirs don't get tarred into the image layer
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "/root"
+	}
+	gopath := filepath.Join(home, ".docksmith", "gopath")
+	gocache := filepath.Join(home, ".docksmith", "gocache")
+	os.MkdirAll(gopath, 0755)
+	os.MkdirAll(gocache, 0755)
 
-	// 🔥 CRITICAL FIXES
+	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
-		"HOME="+buildRoot,
-		"GOPATH="+filepath.Join(buildRoot, "gopath"),
-		"GOCACHE="+filepath.Join(buildRoot, "gocache"),
+		"HOME="+home,
+		"GOPATH="+gopath,
+		"GOCACHE="+gocache,
 	)
 
-	// Add ENV variables from Dockerfile
 	for k, v := range envMap {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -353,68 +371,48 @@ func executeRun(buildRoot, workDir, command string, envMap map[string]string) er
 }
 
 func performCopy(contextDir, src, buildRoot, dest, workDir string) error {
-
-	// Resolve source path
 	srcPath := filepath.Join(contextDir, src)
 
-	// Resolve destination path inside container
 	destPath := dest
-
-	// If dest is relative → place inside WORKDIR
 	if !filepath.IsAbs(destPath) {
 		destPath = filepath.Join(workDir, destPath)
 	}
-
 	destAbs := filepath.Join(buildRoot, destPath)
 
-	// Get source info
 	info, err := os.Stat(srcPath)
 	if err != nil {
 		return err
 	}
 
-	// Case 1: Source is a directory (e.g., COPY . .)
 	if info.IsDir() {
-
-		// Ensure destination exists
 		if err := os.MkdirAll(destAbs, 0755); err != nil {
 			return err
 		}
-
 		return filepath.Walk(srcPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-
 			rel, err := filepath.Rel(srcPath, path)
 			if err != nil {
 				return err
 			}
-
 			target := filepath.Join(destAbs, rel)
-
 			if info.IsDir() {
 				return os.MkdirAll(target, 0755)
 			}
-
-			// Ensure parent dir exists
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
-
 			return copyFile(path, target)
 		})
 	}
 
-	// Case 2: Source is a file
-	// If dest ends with "/" → treat as directory
 	if strings.HasSuffix(dest, "/") {
 		if err := os.MkdirAll(destAbs, 0755); err != nil {
 			return err
 		}
 		destAbs = filepath.Join(destAbs, filepath.Base(srcPath))
 	} else {
-		// Ensure parent exists
 		if err := os.MkdirAll(filepath.Dir(destAbs), 0755); err != nil {
 			return err
 		}
@@ -448,13 +446,11 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	// Get source permissions
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 
-	// Create destination with SAME permissions
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
 	if err != nil {
 		return err

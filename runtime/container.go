@@ -24,22 +24,9 @@ func RunContainer(imageRef string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create container rootfs: %w", err)
 	}
-	//defer os.RemoveAll(rootfs)
-	// DEBUG: Print rootfs contents after extraction
-	fmt.Println("=== ROOTFS CONTENTS ===")
-	filepath.Walk(rootfs, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		rel, _ := filepath.Rel(rootfs, path)
-		fmt.Printf("  %s (mode=%s, size=%d)\n", rel, info.Mode(), info.Size())
-		return nil
-	})
-	fmt.Println("=======================")
+	// defer os.RemoveAll(rootfs)
 
-	fmt.Println("Container rootfs:", rootfs)
-
-	// 3. Extract layers in order
+	// 3. Extract layers in order FIRST, then debug print
 	for _, layer := range manifest.Layers {
 		if layer.Digest == "" {
 			continue
@@ -60,10 +47,16 @@ func RunContainer(imageRef string) error {
 		}
 	}
 
+	// DEBUG: Print rootfs contents AFTER extraction so we see what's actually there
+	
+	fmt.Println("Container rootfs:", rootfs)
+
 	// 4. Resolve working directory
+	workDir := manifest.Config.WorkingDir
 	containerDir := rootfs
-	if manifest.Config.WorkingDir != "" {
-		containerDir = filepath.Join(rootfs, manifest.Config.WorkingDir)
+	if workDir != "" {
+		// Strip leading slash so filepath.Join works correctly
+		containerDir = filepath.Join(rootfs, filepath.Clean(workDir))
 		if err := os.MkdirAll(containerDir, 0755); err != nil {
 			return fmt.Errorf("failed to create workdir: %w", err)
 		}
@@ -75,30 +68,40 @@ func RunContainer(imageRef string) error {
 		return fmt.Errorf("no CMD specified in image")
 	}
 
-	// 6. Resolve binary path relative to containerDir
-	binaryPath := cmdArgs[0]
-	if !filepath.IsAbs(binaryPath) {
-		binaryPath = filepath.Join(containerDir, strings.TrimPrefix(binaryPath, "./"))
+	// 6. Resolve binary path
+	// CMD ["app"] + WORKDIR /app → look for binary in rootfs first,
+	// then fall back to containerDir (workdir).
+	// go build -o app writes to cmd.Dir which is buildRoot/workDir,
+	// so the binary lives at rootfs/workDir/app after layer extraction.
+	binaryName := strings.TrimPrefix(cmdArgs[0], "./")
+	binaryPath := ""
+
+	// Try rootfs/<workdir>/<binary> first (most common case)
+	candidate1 := filepath.Join(containerDir, binaryName)
+	// Try rootfs/<binary> as fallback (binary placed at root)
+	candidate2 := filepath.Join(rootfs, binaryName)
+
+	if _, err := os.Stat(candidate1); err == nil {
+		binaryPath = candidate1
+	} else if _, err := os.Stat(candidate2); err == nil {
+		binaryPath = candidate2
+	} else {
+		return fmt.Errorf("binary %q not found — tried:\n  %s\n  %s", binaryName, candidate1, candidate2)
 	}
 
-	// 7. Verify binary exists
-	if _, err := os.Stat(binaryPath); err != nil {
-		return fmt.Errorf("binary not found at %s: %w", binaryPath, err)
-	}
-
-	// 8. Ensure executable bit is set
+	// 7. Ensure executable bit is set
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		return fmt.Errorf("failed to chmod binary: %w", err)
 	}
 
-	// 9. Prepare environment
+	// 8. Prepare environment
 	env := os.Environ()
 	env = append(env, manifest.Config.Env...)
 
 	fmt.Println("Executing:", binaryPath)
 	fmt.Println("Working Dir:", containerDir)
 
-	// 10. Execute directly — no shell, no namespace flags (WSL2 compatible)
+	// 9. Execute directly — no shell, no namespace flags (WSL2 compatible)
 	cmd := exec.Command(binaryPath, cmdArgs[1:]...)
 	cmd.Dir = containerDir
 	cmd.Env = env

@@ -23,8 +23,16 @@ func CreateTar(sourceDir string, tarPath string) error {
 			return err
 		}
 
-		// Skip unwanted files
-		if strings.Contains(file, ".git") || strings.Contains(file, "layer.tar") || strings.Contains(file, ".DS_Store") {
+		// Skip unwanted files and directories
+		base := filepath.Base(file)
+		if strings.Contains(file, ".git") ||
+			strings.Contains(file, "layer.tar") ||
+			strings.Contains(file, ".DS_Store") ||
+			base == "gopath" ||   // FIX: exclude Go module cache from layer
+			base == "gocache" {   // FIX: exclude Go build cache from layer
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -34,7 +42,7 @@ func CreateTar(sourceDir string, tarPath string) error {
 			return err
 		}
 
-		// 🔥 Preserve permissions (VERY IMPORTANT)
+		// Preserve permissions
 		header.Mode = int64(info.Mode())
 
 		// Get relative path
@@ -44,42 +52,23 @@ func CreateTar(sourceDir string, tarPath string) error {
 		}
 		header.Name = relPath
 
-		// Write header (for BOTH file + directory)
+		// Write header (for both files and directories)
 		if err := tarWriter.WriteHeader(header); err != nil {
 			return err
 		}
 
-		// Create header for both files AND directories
-header, err = tar.FileInfoHeader(info, "")
-if err != nil {
-	return err
-}
+		// Directories have no content to write
+		if info.IsDir() {
+			return nil
+		}
 
-relPath, err = filepath.Rel(sourceDir, file)
-if err != nil {
-	return err
-}
-
-header.Name = relPath
-
-// Write header
-if err := tarWriter.WriteHeader(header); err != nil {
-    return err
-}
-
-// If directory → stop here
-if info.IsDir() {
-    return nil
-}
-
-		// Open file
+		// Open and copy file content
 		f, err := os.Open(file)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
 
-		// Copy file content into tar
 		_, err = io.Copy(tarWriter, f)
 		return err
 	})
@@ -120,11 +109,9 @@ func ExtractTar(tarPath string, destDir string) error {
 			}
 
 		case tar.TypeReg, tar.TypeRegA:
-			// Ensure parent dir exists
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 				return err
 			}
-			// Remove existing file/symlink at this path before writing
 			os.Remove(targetPath)
 			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 			if err != nil {
@@ -137,16 +124,13 @@ func ExtractTar(tarPath string, destDir string) error {
 			}
 
 		case tar.TypeSymlink:
-			// Remove existing entry before creating symlink
 			os.Remove(targetPath)
 			os.MkdirAll(filepath.Dir(targetPath), 0755)
 			if err := os.Symlink(header.Linkname, targetPath); err != nil {
-				// Ignore symlink errors (e.g. already exists)
 				continue
 			}
 
 		case tar.TypeLink:
-			// Hard link
 			linkTarget := filepath.Join(destDir, filepath.Clean(header.Linkname))
 			os.Remove(targetPath)
 			os.MkdirAll(filepath.Dir(targetPath), 0755)
@@ -155,7 +139,6 @@ func ExtractTar(tarPath string, destDir string) error {
 			}
 
 		default:
-			// Skip special files (dev/console, sockets, etc.) - safe to ignore
 			continue
 		}
 	}
