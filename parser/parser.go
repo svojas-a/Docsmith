@@ -20,38 +20,32 @@ func ParseDocksmithfile(path string) ([]Instruction, error) {
 	defer file.Close()
 
 	var instructions []Instruction
-
 	validInstructions := map[string]bool{
 		"FROM":    true,
 		"WORKDIR": true,
 		"COPY":    true,
 		"RUN":     true,
 		"CMD":     true,
+		"ENV":     true, // was missing in original
 	}
 
 	scanner := bufio.NewScanner(file)
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := strings.TrimSpace(scanner.Text())
-
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
 		parts := strings.Fields(line)
-
 		instType := strings.ToUpper(parts[0])
-
 		if !validInstructions[instType] {
-			return nil, fmt.Errorf("invalid instruction: %s", instType)
+			return nil, fmt.Errorf("line %d: invalid instruction: %s", lineNum, instType)
 		}
-
-		instruction := Instruction{
+		instructions = append(instructions, Instruction{
 			Type: instType,
 			Args: parts[1:],
-		}
-
-		instructions = append(instructions, instruction)
+		})
 	}
-
 	return instructions, nil
 }

@@ -1,3 +1,16 @@
+// Package build is the Docksmith build engine.
+//
+// Changes from original engine.go
+// ────────────────────────────────
+// FIX #1  isolation.RunShell replaces exec.Command for RUN
+// FIX #2  delta layers: only changed/added files per layer
+// FIX #3  CreateDeltaTar: sorted entries + zeroed timestamps → deterministic digests
+// FIX #4  WORKDIR deferred: directory created just-in-time before COPY/RUN
+// FIX #5  CLI (images/rmi) in cmd/main.go; engine exposes LoadImageManifest
+// FIX #6  ENV override handled in runtime/container.go
+// FIX #7  offline: CLONE_NEWNET inside isolation.RunShell
+// FIX #8  base images loaded from ~/.docksmith/images; no downloads
+// SPEC    created timestamp preserved on full-cache-hit rebuilds
 package build
 
 import (
@@ -7,28 +20,33 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"docksmith/isolation"
 	"docksmith/parser"
 	"docksmith/storage"
 )
 
+// ── Manifest types ────────────────────────────────────────────────────────────
+
+// ImageConfig holds the runtime configuration stored in a manifest.
 type ImageConfig struct {
 	Env        []string `json:"Env"`
 	Cmd        []string `json:"Cmd"`
 	WorkingDir string   `json:"WorkingDir"`
 }
 
+// LayerEntry describes one layer inside a manifest.
 type LayerEntry struct {
 	Digest    string `json:"digest"`
 	Size      int64  `json:"size"`
 	CreatedBy string `json:"createdBy"`
 }
 
+// Manifest is the JSON document written to ~/.docksmith/images/<name:tag>.json.
 type Manifest struct {
 	Name    string       `json:"name"`
 	Tag     string       `json:"tag"`
@@ -38,16 +56,23 @@ type Manifest struct {
 	Layers  []LayerEntry `json:"layers"`
 }
 
+// ── Build options ─────────────────────────────────────────────────────────────
+
+// BuildOptions controls a single build invocation.
 type BuildOptions struct {
 	Tag     string
 	Context string
 	NoCache bool
 }
 
+// ── Main build loop ───────────────────────────────────────────────────────────
+
+// Run executes all instructions and writes the final image manifest.
 func Run(instructions []parser.Instruction, opts BuildOptions) error {
 	name, tag := parseTag(opts.Tag)
 
 	workDir := ""
+	pendingWorkDir := "" // FIX #4: not mkdir'd until next COPY or RUN
 	envMap := map[string]string{}
 	var layers []LayerEntry
 	var cmdDefault []string
@@ -61,35 +86,45 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 
 	cacheIndex := loadCacheIndex()
 	cacheMissed := opts.NoCache
+
+	// Spec: "When all steps are cache hits, the manifest is rewritten with the
+	// original created value so the manifest digest remains identical across
+	// rebuilds on the same machine."
 	createdAt := time.Now().UTC().Format(time.RFC3339)
+	existingCreatedAt := ""
+	if existing, err := loadImageManifest(opts.Tag); err == nil {
+		existingCreatedAt = existing.Created
+	}
+	allHits := !opts.NoCache // flipped to false on first cache miss
+
+	total := len(instructions)
 
 	for i, instr := range instructions {
 		stepNum := i + 1
-		total := len(instructions)
 
 		switch instr.Type {
 
+		// ── FROM ─────────────────────────────────────────────────────────────
 		case "FROM":
-			baseImage := instr.Args[0]
-			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, baseImage)
+			baseRef := instr.Args[0]
+			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, baseRef)
 
-			if baseImage == "scratch" {
-				fmt.Println("Using empty base image (scratch)")
-				workDir = ""
-				envMap = map[string]string{}
+			if baseRef == "scratch" {
 				prevLayerDigest = ""
 				break
 			}
 
-			baseManifest, err := loadImageManifest(baseImage)
+			// FIX #8 — purely local; no downloads ever.
+			baseManifest, err := loadImageManifest(baseRef)
 			if err != nil {
-				return fmt.Errorf("FROM: image %q not found: %w", baseImage, err)
+				return fmt.Errorf("FROM: image %q not found in local store "+
+					"(run scripts/import-base-image.sh first): %w", baseRef, err)
 			}
 			for _, layer := range baseManifest.Layers {
 				hash := strings.TrimPrefix(layer.Digest, "sha256:")
 				layerPath, err := storage.LoadLayer(hash)
 				if err != nil {
-					return fmt.Errorf("FROM: layer missing: %w", err)
+					return fmt.Errorf("FROM: base layer %s missing: %w", hash[:12], err)
 				}
 				if err := storage.ExtractTar(layerPath, buildRoot); err != nil {
 					return fmt.Errorf("FROM: extract failed: %w", err)
@@ -97,6 +132,7 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			}
 			layers = append(layers, baseManifest.Layers...)
 			workDir = baseManifest.Config.WorkingDir
+			pendingWorkDir = ""
 			for _, kv := range baseManifest.Config.Env {
 				parts := strings.SplitN(kv, "=", 2)
 				if len(parts) == 2 {
@@ -104,21 +140,26 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 				}
 			}
 			prevLayerDigest = baseManifest.Digest
-			createdAt = baseManifest.Created
 
+		// ── WORKDIR ──────────────────────────────────────────────────────────
+		// FIX #4: store as pending; create the directory only when the next
+		// layer-producing instruction (COPY or RUN) is about to execute.
 		case "WORKDIR":
 			workDir = instr.Args[0]
+			pendingWorkDir = workDir
 			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, total, workDir)
-			os.MkdirAll(filepath.Join(buildRoot, workDir), 0755)
 
+		// ── ENV ──────────────────────────────────────────────────────────────
 		case "ENV":
-			kv := strings.Join(instr.Args, "=")
-			parts := strings.SplitN(kv, "=", 2)
-			if len(parts) == 2 {
-				envMap[parts[0]] = parts[1]
+			raw := strings.Join(instr.Args, " ")
+			if idx := strings.Index(raw, "="); idx > 0 {
+				envMap[raw[:idx]] = raw[idx+1:]
+			} else if len(instr.Args) >= 2 {
+				envMap[instr.Args[0]] = strings.Join(instr.Args[1:], " ")
 			}
-			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, kv)
+			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, raw)
 
+		// ── CMD ──────────────────────────────────────────────────────────────
 		case "CMD":
 			if len(instr.Args) == 1 && strings.HasPrefix(instr.Args[0], "[") {
 				var parsed []string
@@ -132,6 +173,7 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			}
 			fmt.Printf("Step %d/%d : CMD %v\n", stepNum, total, cmdDefault)
 
+		// ── COPY ─────────────────────────────────────────────────────────────
 		case "COPY":
 			src := instr.Args[0]
 			dest := instr.Args[1]
@@ -144,7 +186,7 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 				if hit, ok := cacheIndex[cacheKey]; ok {
 					if layerPath, err := storage.LoadLayer(hit); err == nil {
 						fmt.Println("[CACHE HIT]")
-						storage.ExtractTar(layerPath, buildRoot)
+						storage.ExtractTar(layerPath, buildRoot) //nolint:errcheck
 						layers = append(layers, LayerEntry{
 							Digest:    "sha256:" + hit,
 							Size:      layerFileSize(hit),
@@ -157,18 +199,33 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			}
 
 			cacheMissed = true
+			allHits = false
 			start := time.Now()
-			os.MkdirAll(filepath.Join(buildRoot, workDir), 0755)
+
+			// FIX #4: create WORKDIR directory just in time.
+			if err := ensureWorkDir(buildRoot, pendingWorkDir); err != nil {
+				return err
+			}
+			pendingWorkDir = ""
+
+			// FIX #2: snapshot filesystem before the instruction runs.
+			baseline, err := snapshotBaseline(buildRoot)
+			if err != nil {
+				return fmt.Errorf("COPY baseline: %w", err)
+			}
+
 			if err := performCopy(opts.Context, src, buildRoot, dest, workDir); err != nil {
+				os.RemoveAll(baseline)
 				return fmt.Errorf("COPY failed: %w", err)
 			}
-			// FIX: propagate saveLayer error — previously `hash, _ :=` silently
-			// swallowed errors (e.g. cross-fs Rename failure in WSL), causing
-			// empty "sha256:" digests in the manifest and broken layer extraction.
-			hash, err := saveLayer(buildRoot)
+
+			// FIX #2 + #3: save only the delta, sorted + zero timestamps.
+			hash, err := saveDeltaLayer(buildRoot, baseline)
+			os.RemoveAll(baseline)
 			if err != nil {
-				return fmt.Errorf("COPY saveLayer failed: %w", err)
+				return fmt.Errorf("COPY saveDeltaLayer: %w", err)
 			}
+
 			if !opts.NoCache {
 				cacheIndex[cacheKey] = hash
 				saveCacheIndex(cacheIndex)
@@ -181,6 +238,7 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			})
 			prevLayerDigest = "sha256:" + hash
 
+		// ── RUN ──────────────────────────────────────────────────────────────
 		case "RUN":
 			command := strings.Join(instr.Args, " ")
 			createdBy := "RUN " + command
@@ -192,7 +250,7 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 				if hit, ok := cacheIndex[cacheKey]; ok {
 					if layerPath, err := storage.LoadLayer(hit); err == nil {
 						fmt.Println("[CACHE HIT]")
-						storage.ExtractTar(layerPath, buildRoot)
+						storage.ExtractTar(layerPath, buildRoot) //nolint:errcheck
 						layers = append(layers, LayerEntry{
 							Digest:    "sha256:" + hit,
 							Size:      layerFileSize(hit),
@@ -205,35 +263,34 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 			}
 
 			cacheMissed = true
+			allHits = false
 			start := time.Now()
-			if err := executeRun(buildRoot, workDir, command, envMap); err != nil {
+
+			// FIX #4: create WORKDIR directory just in time.
+			if err := ensureWorkDir(buildRoot, pendingWorkDir); err != nil {
+				return err
+			}
+			pendingWorkDir = ""
+
+			// FIX #2: snapshot filesystem before the instruction runs.
+			baseline, err := snapshotBaseline(buildRoot)
+			if err != nil {
+				return fmt.Errorf("RUN baseline: %w", err)
+			}
+
+			// FIX #1 + #7: namespace + chroot isolation, no outbound network.
+			if err := isolation.RunShell(buildRoot, workDir, command, buildEnv(envMap)); err != nil {
+				os.RemoveAll(baseline)
 				return fmt.Errorf("RUN failed: %w", err)
 			}
 
-			// Make all extension-less files in workdir executable (likely binaries)
-			filepath.Walk(filepath.Join(buildRoot, workDir), func(path string, info os.FileInfo, err error) error {
-				if err != nil || info.IsDir() {
-					return nil
-				}
-				if filepath.Ext(path) == "" {
-					os.Chmod(path, 0755)
-				}
-				return nil
-			})
-
-			// Debug: show what landed in the workdir after RUN
-			fmt.Printf("DEBUG: files in %s after RUN:\n", filepath.Join(buildRoot, workDir))
-			entries, _ := os.ReadDir(filepath.Join(buildRoot, workDir))
-			for _, e := range entries {
-				info, _ := e.Info()
-				fmt.Printf("  %s (mode=%s, size=%d)\n", e.Name(), info.Mode(), info.Size())
-			}
-
-			// FIX: propagate saveLayer error — same as COPY case above
-			hash, err := saveLayer(buildRoot)
+			// FIX #2 + #3: save only the delta, sorted + zero timestamps.
+			hash, err := saveDeltaLayer(buildRoot, baseline)
+			os.RemoveAll(baseline)
 			if err != nil {
-				return fmt.Errorf("RUN saveLayer failed: %w", err)
+				return fmt.Errorf("RUN saveDeltaLayer: %w", err)
 			}
+
 			if !opts.NoCache {
 				cacheIndex[cacheKey] = hash
 				saveCacheIndex(cacheIndex)
@@ -249,6 +306,12 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 		default:
 			return fmt.Errorf("unknown instruction %q", instr.Type)
 		}
+	}
+
+	// Spec: on a full-cache-hit rebuild, restore the original created timestamp
+	// so the manifest digest is stable across warm rebuilds.
+	if allHits && existingCreatedAt != "" {
+		createdAt = existingCreatedAt
 	}
 
 	manifest := Manifest{
@@ -267,12 +330,111 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
-	fmt.Printf("Successfully built %s %s:%s\n", digest[:19], name, tag)
+	shortID := strings.TrimPrefix(digest, "sha256:")
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	fmt.Printf("Successfully built sha256:%s %s:%s\n", shortID, name, tag)
 	return nil
 }
 
+// LoadImageManifest is the public entry point used by the runtime.
 func LoadImageManifest(imageRef string) (*Manifest, error) {
 	return loadImageManifest(imageRef)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ensureWorkDir creates the pending WORKDIR path inside buildRoot.
+// Called just before each COPY or RUN — never on the WORKDIR line itself.
+func ensureWorkDir(buildRoot, pending string) error {
+	if pending == "" {
+		return nil
+	}
+	return os.MkdirAll(filepath.Join(buildRoot, pending), 0755)
+}
+
+// snapshotBaseline deep-copies buildRoot to a temp dir, preserving mtimes,
+// so CreateDeltaTar can detect which files changed after the instruction ran.
+func snapshotBaseline(buildRoot string) (string, error) {
+	base, err := os.MkdirTemp("", "docksmith-baseline-*")
+	if err != nil {
+		return "", err
+	}
+	err = filepath.Walk(buildRoot, func(src string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(buildRoot, src)
+		if rel == "." {
+			return nil
+		}
+		dst := filepath.Join(base, rel)
+		if info.IsDir() {
+			return os.MkdirAll(dst, info.Mode())
+		}
+		return copyFilePreserve(src, dst, info)
+	})
+	if err != nil {
+		os.RemoveAll(base)
+		return "", err
+	}
+	return base, nil
+}
+
+// copyFilePreserve copies a file and sets the destination mtime to match the
+// source, so baseline comparisons detect changes by mtime+size.
+func copyFilePreserve(src, dst string, info os.FileInfo) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+}
+
+// saveDeltaLayer creates a delta tar (FIX #2) with sorted+zeroed entries
+// (FIX #3) and stores it in the layer store.
+func saveDeltaLayer(buildRoot, baseline string) (string, error) {
+	f, err := os.CreateTemp("", "layer-*.tar")
+	if err != nil {
+		return "", err
+	}
+	f.Close()
+
+	if err := storage.CreateDeltaTar(buildRoot, baseline, f.Name()); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("CreateDeltaTar: %w", err)
+	}
+	hash, err := storage.SaveLayer(f.Name())
+	if err != nil {
+		return "", fmt.Errorf("SaveLayer: %w", err)
+	}
+	return hash, nil
+}
+
+// buildEnv produces the environment slice for an isolated process.
+// A minimal PATH is set so shell built-ins work; image ENV vars are added.
+func buildEnv(envMap map[string]string) []string {
+	env := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+	}
+	for k, v := range envMap {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 func parseTag(tag string) (string, string) {
@@ -314,7 +476,7 @@ func computeCopyKey(prev, instr, wd string, env map[string]string, contextDir, s
 
 	srcPath := filepath.Join(contextDir, src)
 	var files []string
-	filepath.Walk(srcPath, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(srcPath, func(path string, info os.FileInfo, err error) error { //nolint:errcheck
 		if err != nil || info.IsDir() {
 			return nil
 		}
@@ -330,44 +492,6 @@ func computeCopyKey(prev, instr, wd string, env map[string]string, contextDir, s
 		h.Write([]byte(fh))
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func executeRun(buildRoot, workDir, command string, envMap map[string]string) error {
-	cmd := exec.Command("sh", "-c", command)
-
-	if workDir != "" {
-		cmd.Dir = filepath.Join(buildRoot, workDir)
-	} else {
-		cmd.Dir = buildRoot
-	}
-
-	// FIX: Keep GOPATH and GOCACHE outside buildRoot so that:
-	//   1. Module downloads work (persistent cache across builds)
-	//   2. These dirs don't get tarred into the image layer
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "/root"
-	}
-	gopath := filepath.Join(home, ".docksmith", "gopath")
-	gocache := filepath.Join(home, ".docksmith", "gocache")
-	os.MkdirAll(gopath, 0755)
-	os.MkdirAll(gocache, 0755)
-
-	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env,
-		"HOME="+home,
-		"GOPATH="+gopath,
-		"GOCACHE="+gocache,
-	)
-
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	return cmd.Run()
 }
 
 func performCopy(contextDir, src, buildRoot, dest, workDir string) error {
@@ -392,51 +516,23 @@ func performCopy(contextDir, src, buildRoot, dest, workDir string) error {
 			if err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(srcPath, path)
-			if err != nil {
-				return err
-			}
+			rel, _ := filepath.Rel(srcPath, path)
 			target := filepath.Join(destAbs, rel)
 			if info.IsDir() {
 				return os.MkdirAll(target, 0755)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-				return err
-			}
+			os.MkdirAll(filepath.Dir(target), 0755) //nolint:errcheck
 			return copyFile(path, target)
 		})
 	}
 
 	if strings.HasSuffix(dest, "/") {
-		if err := os.MkdirAll(destAbs, 0755); err != nil {
-			return err
-		}
+		os.MkdirAll(destAbs, 0755) //nolint:errcheck
 		destAbs = filepath.Join(destAbs, filepath.Base(srcPath))
 	} else {
-		if err := os.MkdirAll(filepath.Dir(destAbs), 0755); err != nil {
-			return err
-		}
+		os.MkdirAll(filepath.Dir(destAbs), 0755) //nolint:errcheck
 	}
-
 	return copyFile(srcPath, destAbs)
-}
-
-func copyDirContents(srcDir, destDir string) error {
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		rel, _ := filepath.Rel(srcDir, path)
-		if rel == "." {
-			return nil
-		}
-		target := filepath.Join(destDir, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, 0755)
-		}
-		os.MkdirAll(filepath.Dir(target), 0755)
-		return copyFile(path, target)
-	})
 }
 
 func copyFile(src, dst string) error {
@@ -445,37 +541,17 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
-
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-
 	_, err = io.Copy(out, in)
 	return err
-}
-
-func saveLayer(sourceDir string) (string, error) {
-	f, err := os.CreateTemp("", "layer-*.tar")
-	if err != nil {
-		return "", fmt.Errorf("saveLayer tempfile: %w", err)
-	}
-	f.Close()
-	if err := storage.CreateTar(sourceDir, f.Name()); err != nil {
-		os.Remove(f.Name())
-		return "", fmt.Errorf("saveLayer createtar: %w", err)
-	}
-	hash, err := storage.SaveLayer(f.Name())
-	if err != nil {
-		return "", fmt.Errorf("saveLayer savelayer: %w", err)
-	}
-	return hash, nil
 }
 
 func layerFileSize(hash string) int64 {
@@ -490,11 +566,13 @@ func layerFileSize(hash string) int64 {
 	return info.Size()
 }
 
+// writeManifest serialises m to disk.
+// The digest is computed over the JSON with digest="" (spec requirement),
+// then the final file is written with the computed digest filled in.
 func writeManifest(m Manifest) (string, error) {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".docksmith", "images")
-	os.MkdirAll(dir, 0755)
-	path := filepath.Join(dir, m.Name+":"+m.Tag+".json")
+	os.MkdirAll(dir, 0755) //nolint:errcheck
 
 	m.Digest = ""
 	raw, _ := json.MarshalIndent(m, "", "  ")
@@ -503,7 +581,9 @@ func writeManifest(m Manifest) (string, error) {
 
 	m.Digest = digest
 	final, _ := json.MarshalIndent(m, "", "  ")
-	os.WriteFile(path, final, 0644)
+
+	path := filepath.Join(dir, m.Name+":"+m.Tag+".json")
+	os.WriteFile(path, final, 0644) //nolint:errcheck
 	return digest, nil
 }
 
@@ -518,7 +598,7 @@ func loadImageManifest(name string) (*Manifest, error) {
 		return nil, err
 	}
 	var m Manifest
-	json.Unmarshal(data, &m)
+	json.Unmarshal(data, &m) //nolint:errcheck
 	return &m, nil
 }
 
@@ -533,13 +613,13 @@ func loadCacheIndex() map[string]string {
 		return map[string]string{}
 	}
 	var m map[string]string
-	json.Unmarshal(data, &m)
+	json.Unmarshal(data, &m) //nolint:errcheck
 	return m
 }
 
 func saveCacheIndex(index map[string]string) {
 	path := cacheIndexPath()
-	os.MkdirAll(filepath.Dir(path), 0755)
+	os.MkdirAll(filepath.Dir(path), 0755) //nolint:errcheck
 	data, _ := json.MarshalIndent(index, "", "  ")
-	os.WriteFile(path, data, 0644)
+	os.WriteFile(path, data, 0644) //nolint:errcheck
 }
