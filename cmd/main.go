@@ -15,12 +15,14 @@ import (
 	"time"
 
 	"docksmith/build"
+	"docksmith/isolation"
 	"docksmith/parser"
 	"docksmith/runtime"
 	"docksmith/storage"
 )
 
 func main() {
+	isolation.MaybeRunAsContainerChild()
 	if err := storage.InitStorage(); err != nil {
 		fmt.Fprintf(os.Stderr, "storage init failed: %v\n", err)
 		os.Exit(1)

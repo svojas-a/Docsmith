@@ -1,26 +1,3 @@
-// Package isolation provides the single primitive used for BOTH
-// `docksmith run` and RUN during build: a new Linux mount+UTS+IPC+PID+NET
-// namespace with a chroot into the container rootfs.
-//
-// FIX #1 — process isolation:
-//   The original code called exec.Command directly on the host, giving
-//   the command full access to the host filesystem and network.
-//   We now use syscall.SysProcAttr with Cloneflags to create new namespaces
-//   and Chroot to confine the process to the assembled rootfs.
-//
-// FIX #7 — offline enforcement (network namespace):
-//   CLONE_NEWNET creates a fresh network namespace with no external
-//   interfaces, so the process cannot reach the internet.
-//
-// CRITICAL path-resolution note:
-//   When SysProcAttr.Chroot is set the kernel executes:
-//     chroot(Chroot) → chdir(cmd.Dir) → execve(cmd.Path, ...)
-//   Therefore cmd.Path must be the path INSIDE the new root (e.g. "/bin/sh"),
-//   NOT the host-side absolute path (e.g. "/tmp/docksmith-build-xxx/bin/sh").
-//   exec.Command() calls LookPath which produces the host path → ENOENT after
-//   chroot.  We bypass this by constructing exec.Cmd directly and setting
-//   cmd.Path to the in-chroot path, after verifying the binary exists on the
-//   host side.
 package isolation
 
 import (
@@ -32,38 +9,100 @@ import (
 	"syscall"
 )
 
-// RunOptions configures a single isolated execution.
-type RunOptions struct {
-	// Rootfs is the assembled container filesystem root on the host.
-	Rootfs string
-	// WorkDir is the working directory INSIDE the container (e.g. "/app").
-	// Defaults to "/" if empty.
-	WorkDir string
-	// Argv is [binary, arg0, arg1, ...].
-	// binary must be an absolute path inside the container (e.g. "/bin/sh",
-	// "/app/myapp").  Bare names are searched in standard PATH dirs.
-	Argv []string
-	// Env is the full environment slice ("KEY=value") for the process.
-	Env []string
-	// Stdin/Stdout/Stderr — defaults to os.Stdin/Stdout/Stderr when nil.
-	Stdin  *os.File
-	Stdout *os.File
-	Stderr *os.File
-}
+// childEnvKey is the env var used to pass container parameters to the
+// re-exec'd child process.
+const childEnvKey = "__DOCKSMITH_CONTAINER"
 
-// Run executes a command inside an isolated container environment.
-// This is the SINGLE isolation primitive used by both the build engine
-// (RUN instruction) and the runtime (docksmith run).
-func Run(opts RunOptions) error {
-	if len(opts.Argv) == 0 {
-		return fmt.Errorf("isolation.Run: no command specified")
+// MaybeRunAsContainerChild must be called at the very start of main().
+// If this process was re-executed as a container child, it sets up the
+// container (pivot_root, exec) and never returns. Otherwise it returns.
+func MaybeRunAsContainerChild() {
+	val := os.Getenv(childEnvKey)
+	if val == "" {
+		return
 	}
+	// val = "rootfs\x00workdir\x00binary\x00arg0\x00arg1..."
+	parts := strings.Split(val, "\x01")
+	if len(parts) < 3 {
+		fmt.Fprintln(os.Stderr, "docksmith: malformed container env")
+		os.Exit(1)
+	}
+	rootfs := parts[0]
+	workDir := parts[1]
+	binary := parts[2]
+	argv := parts[2:] // binary is argv[0]
 
-	workDir := opts.WorkDir
 	if workDir == "" {
 		workDir = "/"
 	}
 
+	// ── Step 1: bind-mount rootfs onto itself ─────────────────────────────
+	// Required for pivot_root: new root must be a mount point.
+	// Works in a user-owned mount namespace (CLONE_NEWUSER | CLONE_NEWNS).
+	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "docksmith: bind mount: %v\n", err)
+		os.Exit(1)
+	}
+
+	// ── Step 2: create a directory inside rootfs for the old root ─────────
+	oldRoot := filepath.Join(rootfs, ".old_root")
+	if err := os.MkdirAll(oldRoot, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "docksmith: mkdir old_root: %v\n", err)
+		os.Exit(1)
+	}
+
+	// ── Step 3: pivot_root ────────────────────────────────────────────────
+	// Makes rootfs the new filesystem root.
+	// Old root is moved to /.old_root inside the new root.
+	if err := syscall.PivotRoot(rootfs, oldRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "docksmith: pivot_root: %v\n", err)
+		os.Exit(1)
+	}
+	syscall.Chdir("/")
+
+	// ── Step 4: unmount old root ──────────────────────────────────────────
+	// After pivot_root, the container process can no longer see the host fs.
+	syscall.Unmount("/.old_root", syscall.MNT_DETACH) //nolint:errcheck
+	os.Remove("/.old_root")
+
+	// ── Step 5: chdir to working directory ───────────────────────────────
+	if workDir != "/" {
+		if err := syscall.Chdir(workDir); err != nil {
+			// Non-fatal: workdir may not exist in this image.
+			syscall.Chdir("/") //nolint:errcheck
+		}
+	}
+
+	// ── Step 6: exec the real binary ─────────────────────────────────────
+	os.Unsetenv(childEnvKey)
+	if err := syscall.Exec(binary, argv, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "docksmith: exec %s: %v\n", binary, err)
+		os.Exit(1)
+	}
+}
+
+// ── RunOptions ────────────────────────────────────────────────────────────────
+
+type RunOptions struct {
+	Rootfs    string
+	WorkDir   string
+	Argv      []string
+	Env       []string
+	BuildMode bool
+	Stdin     *os.File
+	Stdout    *os.File
+	Stderr    *os.File
+}
+
+// Run is the single entry point for build and runtime execution.
+func Run(opts RunOptions) error {
+	if len(opts.Argv) == 0 {
+		return fmt.Errorf("isolation.Run: no command specified")
+	}
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = "/"
+	}
 	stdin := opts.Stdin
 	if stdin == nil {
 		stdin = os.Stdin
@@ -76,94 +115,140 @@ func Run(opts RunOptions) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
+	if opts.BuildMode {
+		return runBuildMode(opts, workDir, stdin, stdout, stderr)
+	}
+	return runRuntimeMode(opts, workDir, stdin, stdout, stderr)
+}
 
-	// Resolve the binary to an absolute in-chroot path and verify it exists
-	// on the host before we hand off to the kernel.
-	inChrootPath, err := resolveInChroot(opts.Rootfs, opts.Argv[0])
+// ── Build mode ────────────────────────────────────────────────────────────────
+
+func runBuildMode(opts RunOptions, workDir string, stdin, stdout, stderr *os.File) error {
+	hostSh, err := exec.LookPath("sh")
 	if err != nil {
-		return fmt.Errorf("isolation.Run: %w", err)
+		hostSh = "/bin/sh"
+	}
+	hostWorkDir := filepath.Join(opts.Rootfs, workDir)
+	if err := os.MkdirAll(hostWorkDir, 0755); err != nil {
+		return fmt.Errorf("isolation (build): %w", err)
+	}
+	cmd := exec.Command(hostSh, "-c", strings.Join(opts.Argv, " "))
+	cmd.Dir = hostWorkDir
+	cmd.Env = opts.Env
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("RUN command failed: %w", err)
+	}
+	return nil
+}
+
+// ── Runtime mode ──────────────────────────────────────────────────────────────
+//
+// Re-exec pattern with pivot_root:
+//
+//  Parent: fork /proc/self/exe (this binary) into CLONE_NEWUSER + CLONE_NEWNS.
+//          Go writes uid/gid maps from the parent (allowed).
+//          Child env var carries rootfs, workdir, binary, argv.
+//
+//  Child:  MaybeRunAsContainerChild() runs at start of main().
+//          bind-mount rootfs → pivot_root → unmount old root → exec binary.
+//          After pivot_root, the child has no access to the host filesystem.
+//
+// This works without root on standard Linux (Ubuntu 18.04+) because:
+//  • CLONE_NEWUSER: user namespace where process has full capabilities.
+//  • CLONE_NEWNS:   mount namespace owned by the user namespace.
+//  • bind-mount + pivot_root: allowed in a user-owned mount namespace.
+
+func runRuntimeMode(opts RunOptions, workDir string, stdin, stdout, stderr *os.File) error {
+	inChrootPath, err := resolveInChroot(opts.Rootfs, opts.WorkDir, opts.Argv[0])
+	if err != nil {
+		return fmt.Errorf("isolation (runtime): %w", err)
 	}
 
-	// Build exec.Cmd manually — do NOT use exec.Command() because it calls
-	// LookPath and overwrites cmd.Path with the host absolute path, which is
-	// invalid after the kernel applies the chroot.
-	//
-	// cmd.Path  = in-chroot path  → kernel resolves this after chroot
-	// cmd.Args  = full argv slice (Args[0] is conventionally the program name)
-	// cmd.Dir   = working dir inside the chroot
+	// Encode all parameters as a NUL-separated string in an env var.
+	params := append([]string{opts.Rootfs, workDir}, inChrootPath)
+	if len(opts.Argv) > 1 {
+		params = append(params, opts.Argv[1:]...)
+	}
+	// params[2:] = inChrootPath + additional args = full argv
+	childVal := strings.Join(params, "\x01")
+
+	childEnv := make([]string, 0, len(opts.Env)+1)
+	for _, e := range opts.Env {
+		if !strings.HasPrefix(e, childEnvKey+"=") {
+			childEnv = append(childEnv, e)
+		}
+	}
+	childEnv = append(childEnv, childEnvKey+"="+childVal)
+
+	uid := syscall.Getuid()
+	gid := syscall.Getgid()
+
+	exe := "/proc/self/exe"
+
 	cmd := &exec.Cmd{
-		Path:   inChrootPath,
-		Args:   opts.Argv,
+		Path:   exe,
+		Args:   []string{"docksmith-container"},
 		Stdin:  stdin,
 		Stdout: stdout,
 		Stderr: stderr,
-		Env:    opts.Env,
-		Dir:    workDir,
+		Env:    childEnv,
+		SysProcAttr: &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER,
+			UidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: uid, Size: 1},
+			},
+			GidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: gid, Size: 1},
+			},
+		},
 	}
-
-	// FIX #1 — Linux namespaces + chroot.
-	// CLONE_NEWNS  : new mount namespace  (container mounts don't affect host)
-	// CLONE_NEWUTS : new UTS namespace    (container hostname isolated)
-	// CLONE_NEWIPC : new IPC namespace    (SysV IPC isolated)
-	// CLONE_NEWPID : new PID namespace    (container PID 1 is the process)
-	// CLONE_NEWNET : new network namespace (FIX #7 — no outbound network)
-	//
-	// Chroot: rootfs — kernel chroots before exec, so the process can only
-	// see what is under rootfs.  A file written inside CANNOT appear on host.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWIPC |
-			syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWNET,
-		Chroot: opts.Rootfs,
-	}
-
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("container process exited with error: %w", err)
 	}
 	return nil
 }
 
-// RunShell runs a shell command string inside the isolated rootfs.
-// Used by the build engine for every RUN instruction.
-func RunShell(rootfs, workDir, shellCmd string, env []string) error {
-	return Run(RunOptions{
-		Rootfs:  rootfs,
-		WorkDir: workDir,
-		Argv:    []string{"/bin/sh", "-c", shellCmd},
-		Env:     env,
-	})
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func RunBuild(rootfs, workDir, command string, env []string) error {
+	return Run(RunOptions{Rootfs: rootfs, WorkDir: workDir, Argv: []string{command}, Env: env, BuildMode: true})
 }
 
-// resolveInChroot returns the absolute path of binary INSIDE the container
-// (e.g. "/bin/sh") after confirming it exists on the host at rootfs+path.
-//
-// If binary is already absolute (starts with "/") we just validate it.
-// If it is bare (e.g. "myapp") we search the standard PATH directories.
-func resolveInChroot(rootfs, binary string) (string, error) {
-	// Absolute in-container path — validate on host and return as-is.
-	if strings.HasPrefix(binary, "/") {
-		hostPath := filepath.Join(rootfs, binary)
-		info, err := os.Stat(hostPath)
-		if err != nil || info.IsDir() {
-			return "", fmt.Errorf("binary %q not found in rootfs", binary)
-		}
-		return binary, nil
-	}
+func RunContainer(rootfs, workDir string, argv []string, env []string) error {
+	return Run(RunOptions{Rootfs: rootfs, WorkDir: workDir, Argv: argv, Env: env, BuildMode: false})
+}
 
-	// Bare name — search standard PATH locations inside rootfs.
-	searchDirs := []string{
-		"/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin",
-	}
-	for _, dir := range searchDirs {
-		inChroot := filepath.Join(dir, binary)
-		hostPath := filepath.Join(rootfs, inChroot)
-		info, err := os.Stat(hostPath)
-		if err == nil && !info.IsDir() {
-			return inChroot, nil
-		}
-	}
+func RunShell(rootfs, workDir, shellCmd string, env []string) error {
+	return Run(RunOptions{Rootfs: rootfs, WorkDir: workDir, Argv: []string{"/bin/sh", "-c", shellCmd}, Env: env, BuildMode: false})
+}
 
-	return "", fmt.Errorf("binary %q not found in rootfs %s (searched PATH)", binary, rootfs)
+func resolveInChroot(rootfs, workDir, binary string) (string, error) {
+    if strings.HasPrefix(binary, "/") {
+        hostPath := filepath.Join(rootfs, binary)
+        info, err := os.Stat(hostPath)
+        if err != nil || info.IsDir() {
+            return "", fmt.Errorf("binary %q not found in container image", binary)
+        }
+        return binary, nil
+    }
+
+    // Check WORKDIR first — critical for scratch images
+    searchDirs := []string{}
+    if workDir != "" && workDir != "/" {
+        searchDirs = append(searchDirs, workDir)
+    }
+    searchDirs = append(searchDirs, "/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin")
+
+    for _, dir := range searchDirs {
+        inChroot := filepath.Join(dir, binary)
+        hostPath := filepath.Join(rootfs, inChroot)
+        info, err := os.Stat(hostPath)
+        if err == nil && !info.IsDir() {
+            return inChroot, nil
+        }
+    }
+    return "", fmt.Errorf("binary %q not found in container image (searched PATH)", binary)
 }

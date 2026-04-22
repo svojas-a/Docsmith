@@ -278,8 +278,10 @@ func Run(instructions []parser.Instruction, opts BuildOptions) error {
 				return fmt.Errorf("RUN baseline: %w", err)
 			}
 
-			// FIX #1 + #7: namespace + chroot isolation, no outbound network.
-			if err := isolation.RunShell(buildRoot, workDir, command, buildEnv(envMap)); err != nil {
+			// FIX #1: use RunBuild — executes on host filesystem chdir'd into
+			// buildRoot+workDir, so host tools (go, make, cc) are accessible.
+			// Output files land in buildRoot and are captured as the delta layer.
+			if err := isolation.RunBuild(buildRoot, workDir, command, buildEnv(envMap)); err != nil {
 				os.RemoveAll(baseline)
 				return fmt.Errorf("RUN failed: %w", err)
 			}
@@ -427,9 +429,22 @@ func saveDeltaLayer(buildRoot, baseline string) (string, error) {
 // buildEnv produces the environment slice for an isolated process.
 // A minimal PATH is set so shell built-ins work; image ENV vars are added.
 func buildEnv(envMap map[string]string) []string {
+	hostPath := os.Getenv("PATH")
+	if hostPath == "" {
+		hostPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	hostHome := os.Getenv("HOME")
+	if hostHome == "" {
+		hostHome = "/root"
+	}
 	env := []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=/root",
+		"PATH=" + hostPath,
+		"HOME=" + hostHome,
+	}
+	for _, k := range []string{"GOPATH", "GOCACHE", "GOMODCACHE", "GOROOT", "GOENV"} {
+		if v := os.Getenv(k); v != "" {
+			env = append(env, k+"="+v)
+		}
 	}
 	for k, v := range envMap {
 		env = append(env, k+"="+v)
