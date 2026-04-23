@@ -1,114 +1,128 @@
+// Package runtime implements `docksmith run`.
+//
+// FIX #1 — Uses isolation.Run (same primitive as the build engine RUN step).
+//           The original used exec.Command directly; now the container process
+//           runs inside Linux namespaces with a chroot to the assembled rootfs.
+//
+// FIX #6 — Supports -e KEY=VALUE environment overrides.  Image ENV values
+//           are applied first; -e flags override them.
+//
+// FIX #7 — Network isolation is implicit: isolation.Run sets CLONE_NEWNET,
+//           so the container has no external network interface.
 package runtime
 
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"docksmith/build"
+	"docksmith/isolation"
 	"docksmith/storage"
 )
 
-func RunContainer(imageRef string) error {
+// RunOptions controls `docksmith run`.
+type RunOptions struct {
+	// ImageRef is "name:tag".
+	ImageRef string
+	// CmdOverride replaces the image CMD when non-empty.
+	CmdOverride []string
+	// EnvOverrides are KEY=VALUE pairs from -e flags (FIX #6).
+	EnvOverrides []string
+}
 
-	// 1. Load manifest
-	manifest, err := build.LoadImageManifest(imageRef)
+// RunContainer assembles the image filesystem and starts an isolated container.
+func RunContainer(opts RunOptions) error {
+	// 1. Load manifest (FIX #8 — purely from local store).
+	manifest, err := build.LoadImageManifest(opts.ImageRef)
 	if err != nil {
-		return fmt.Errorf("failed to load image: %w", err)
+		return fmt.Errorf("image %q not found: %w", opts.ImageRef, err)
 	}
 
-	// 2. Create container rootfs
+	// 2. Assemble rootfs in a temporary directory.
 	rootfs, err := os.MkdirTemp("", "docksmith-container-*")
 	if err != nil {
-		return fmt.Errorf("failed to create container rootfs: %w", err)
+		return fmt.Errorf("failed to create rootfs: %w", err)
 	}
-	// defer os.RemoveAll(rootfs)
+	defer os.RemoveAll(rootfs)
 
-	// 3. Extract layers in order FIRST, then debug print
 	for _, layer := range manifest.Layers {
 		if layer.Digest == "" {
 			continue
 		}
-
 		hash := strings.TrimPrefix(layer.Digest, "sha256:")
 		if hash == "" {
 			continue
 		}
-
 		layerPath, err := storage.LoadLayer(hash)
 		if err != nil {
-			return fmt.Errorf("layer not found: %s", hash)
+			return fmt.Errorf("layer %s not found — image may be corrupt", hash)
 		}
-
-		if err = storage.ExtractTar(layerPath, rootfs); err != nil {
+		if err := storage.ExtractTar(layerPath, rootfs); err != nil {
 			return fmt.Errorf("failed to extract layer %s: %w", hash, err)
 		}
 	}
 
-	// DEBUG: Print rootfs contents AFTER extraction so we see what's actually there
-	
-	fmt.Println("Container rootfs:", rootfs)
+	// 3. Resolve CMD.
+	argv := manifest.Config.Cmd
+	if len(opts.CmdOverride) > 0 {
+		argv = opts.CmdOverride
+	}
+	if len(argv) == 0 {
+		return fmt.Errorf("no CMD defined in image and no command given at runtime")
+	}
 
-	// 4. Resolve working directory
-	workDir := manifest.Config.WorkingDir
-	containerDir := rootfs
-	if workDir != "" {
-		// Strip leading slash so filepath.Join works correctly
-		containerDir = filepath.Join(rootfs, filepath.Clean(workDir))
-		if err := os.MkdirAll(containerDir, 0755); err != nil {
-			return fmt.Errorf("failed to create workdir: %w", err)
+	// 4. Build environment: image ENV first, then -e overrides (FIX #6).
+	envMap := map[string]string{}
+	for _, kv := range manifest.Config.Env {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
 		}
 	}
-
-	// 5. Resolve CMD
-	cmdArgs := manifest.Config.Cmd
-	if len(cmdArgs) == 0 {
-		return fmt.Errorf("no CMD specified in image")
+	// -e KEY=VALUE overrides take precedence.
+	for _, kv := range opts.EnvOverrides {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("-e %q is not in KEY=VALUE form", kv)
+		}
+		envMap[parts[0]] = parts[1]
+	}
+	env := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+	}
+	for k, v := range envMap {
+		env = append(env, k+"="+v)
 	}
 
-	// 6. Resolve binary path
-	// CMD ["app"] + WORKDIR /app → look for binary in rootfs first,
-	// then fall back to containerDir (workdir).
-	// go build -o app writes to cmd.Dir which is buildRoot/workDir,
-	// so the binary lives at rootfs/workDir/app after layer extraction.
-	binaryName := strings.TrimPrefix(cmdArgs[0], "./")
-	binaryPath := ""
-
-	// Try rootfs/<workdir>/<binary> first (most common case)
-	candidate1 := filepath.Join(containerDir, binaryName)
-	// Try rootfs/<binary> as fallback (binary placed at root)
-	candidate2 := filepath.Join(rootfs, binaryName)
-
-	if _, err := os.Stat(candidate1); err == nil {
-		binaryPath = candidate1
-	} else if _, err := os.Stat(candidate2); err == nil {
-		binaryPath = candidate2
-	} else {
-		return fmt.Errorf("binary %q not found — tried:\n  %s\n  %s", binaryName, candidate1, candidate2)
+	// 5. Working directory inside the container.
+	workDir := manifest.Config.WorkingDir
+	if workDir == "" {
+		workDir = "/"
 	}
 
-	// 7. Ensure executable bit is set
-	if err := os.Chmod(binaryPath, 0755); err != nil {
-		return fmt.Errorf("failed to chmod binary: %w", err)
+	// Ensure workDir exists inside rootfs (base images always have /; custom
+	// WORKDIR dirs should already be in the layers).
+	os.MkdirAll(filepath.Join(rootfs, workDir), 0755) //nolint:errcheck
+
+	// 6. Execute inside the isolated container (FIX #1).
+	//    isolation.Run uses the SAME namespace+chroot mechanism as the build engine.
+	fmt.Printf("Starting container from image %s (rootfs: %s)\n", opts.ImageRef, rootfs)
+
+	if err := isolation.Run(isolation.RunOptions{
+		Rootfs:  rootfs,
+		WorkDir: workDir,
+		Argv:    argv,
+		Env:     env,
+		Stdin:   os.Stdin,
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+	}); err != nil {
+		return err
 	}
 
-	// 8. Prepare environment
-	env := os.Environ()
-	env = append(env, manifest.Config.Env...)
-
-	fmt.Println("Executing:", binaryPath)
-	fmt.Println("Working Dir:", containerDir)
-
-	// 9. Execute directly — no shell, no namespace flags (WSL2 compatible)
-	cmd := exec.Command(binaryPath, cmdArgs[1:]...)
-	cmd.Dir = containerDir
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	fmt.Println("Running container...")
-	return cmd.Run()
+	fmt.Printf("Container exited cleanly.\n")
+	return nil
 }

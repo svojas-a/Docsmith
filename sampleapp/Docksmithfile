@@ -1,5 +1,0 @@
-FROM ubuntu
-WORKDIR /app
-COPY . .
-RUN echo "App ready"
-CMD ["./app"]
