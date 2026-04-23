@@ -1,0 +1,6 @@
+go build -o docksmith cmd/main.go  
+
+cd testapp                         
+../docksmith build -t testapp:latest .
+
+../docksmith run testapp:latest  

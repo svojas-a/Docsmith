@@ -1,14 +1,4 @@
-// Package runtime implements `docksmith run`.
-//
-// FIX #1 — Uses isolation.Run (same primitive as the build engine RUN step).
-//           The original used exec.Command directly; now the container process
-//           runs inside Linux namespaces with a chroot to the assembled rootfs.
-//
-// FIX #6 — Supports -e KEY=VALUE environment overrides.  Image ENV values
-//           are applied first; -e flags override them.
-//
-// FIX #7 — Network isolation is implicit: isolation.Run sets CLONE_NEWNET,
-//           so the container has no external network interface.
+
 package runtime
 
 import (

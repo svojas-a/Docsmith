@@ -1,0 +1,6 @@
+FROM scratch
+WORKDIR /app
+ENV MESSAGE=Hello from Demo!
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o demo .
+CMD ["/app/demo"]
